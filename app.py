@@ -1,19 +1,12 @@
 import streamlit as st
-import os
-from pathlib import Path
-import sys
-
-# Add the src directory to the path
-sys.path.append(str(Path(__file__).parent / "src"))
-
-from rag_engine import RAGEngine
-from cv_parser import CVParser
-from neural_classifier import CVClassifier
-from api_handler import APIHandler
 import tempfile
+from pathlib import Path
+import re
 import json
+from datetime import datetime
+import PyPDF2
+from docx import Document
 
-# Page configuration
 st.set_page_config(
     page_title="RAG CV Analysis System - Germany",
     page_icon="📄",
@@ -36,343 +29,303 @@ st.markdown("""
         border-radius: 0.5rem;
         margin: 1rem 0;
     }
-    .stButton>button {
-        width: 100%;
-        background-color: #1f77b4;
-        color: white;
-    }
 </style>
 """, unsafe_allow_html=True)
 
 # Initialize session state
-if 'rag_engine' not in st.session_state:
-    st.session_state.rag_engine = None
 if 'cv_database' not in st.session_state:
     st.session_state.cv_database = []
-if 'chat_history' not in st.session_state:
-    st.session_state.chat_history = []
 
-def initialize_system():
-    """Initialize RAG system components"""
-    if st.session_state.rag_engine is None:
-        with st.spinner("Initializing RAG System..."):
-            api_key = st.session_state.get('api_key', '')
-            st.session_state.rag_engine = RAGEngine(api_key=api_key)
-            st.success("✅ System initialized successfully!")
+# CV Parser Class (Lightweight)
+class CVParser:
+    def __init__(self):
+        self.keywords = {
+            'skills': ['fähigkeiten', 'skills', 'kenntnisse', 'kompetenzen'],
+            'experience': ['berufserfahrung', 'experience', 'arbeitserfahrung'],
+            'education': ['ausbildung', 'education', 'bildung', 'studium'],
+        }
+    
+    def parse_cv(self, file_path, language='de'):
+        file_ext = Path(file_path).suffix.lower()
+        
+        if file_ext == '.pdf':
+            text = self._extract_pdf(file_path)
+        elif file_ext == '.docx':
+            text = self._extract_docx(file_path)
+        elif file_ext == '.txt':
+            with open(file_path, 'r', encoding='utf-8') as f:
+                text = f.read()
+        else:
+            text = "Unsupported format"
+        
+        return self._parse_text(text)
+    
+    def _extract_pdf(self, pdf_path):
+        text = ""
+        try:
+            with open(pdf_path, 'rb') as file:
+                pdf_reader = PyPDF2.PdfReader(file)
+                for page in pdf_reader.pages:
+                    text += page.extract_text() + "\n"
+        except:
+            text = "Error extracting PDF"
+        return text
+    
+    def _extract_docx(self, docx_path):
+        try:
+            doc = Document(docx_path)
+            text = "\n".join([p.text for p in doc.paragraphs])
+        except:
+            text = "Error extracting DOCX"
+        return text
+    
+    def _parse_text(self, text):
+        return {
+            'personal_info': self._extract_personal(text),
+            'skills': self._extract_skills(text),
+            'experience': self._extract_experience(text),
+            'education': self._extract_education(text),
+            'raw_text': text
+        }
+    
+    def _extract_personal(self, text):
+        info = {}
+        lines = text.split('\n')
+        if lines:
+            info['name'] = lines[0].strip()
+        
+        email = re.search(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', text)
+        if email:
+            info['email'] = email.group()
+        
+        phone = re.search(r'(\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,4}', text)
+        if phone:
+            info['phone'] = phone.group()
+        
+        return info
+    
+    def _extract_skills(self, text):
+        tech_skills = ['python', 'java', 'javascript', 'c++', 'sql', 'machine learning',
+                      'deep learning', 'tensorflow', 'pytorch', 'docker', 'kubernetes']
+        
+        skills = [skill.title() for skill in tech_skills if skill in text.lower()]
+        return skills[:15]
+    
+    def _extract_experience(self, text):
+        experiences = []
+        date_pattern = r'(\d{2}[-/.]\d{4}|\d{4})\s*[-–]\s*(\d{2}[-/.]\d{4}|\d{4}|present|heute)'
+        matches = re.finditer(date_pattern, text, re.IGNORECASE)
+        
+        for match in list(matches)[:5]:
+            context = text[max(0, match.start()-100):match.start()+300]
+            experiences.append({
+                'duration': match.group(),
+                'description': context[:200]
+            })
+        
+        return experiences
+    
+    def _extract_education(self, text):
+        education = []
+        degrees = ['bachelor', 'master', 'phd', 'diploma', 'doktor']
+        
+        for degree in degrees:
+            if degree in text.lower():
+                idx = text.lower().index(degree)
+                education.append({
+                    'degree': degree.title(),
+                    'context': text[idx:idx+150]
+                })
+        
+        return education[:3]
 
+# Simple Search Function
+def simple_search(query, cv_database):
+    results = []
+    query_lower = query.lower()
+    
+    for cv in cv_database:
+        text = cv['data']['raw_text'].lower()
+        if query_lower in text:
+            score = text.count(query_lower) / max(len(text.split()), 1)
+            results.append({
+                'filename': cv['filename'],
+                'score': score,
+                'snippet': cv['data']['raw_text'][:300]
+            })
+    
+    return sorted(results, key=lambda x: x['score'], reverse=True)
+
+# Main App
 def main():
-    st.markdown('<h1 class="main-header">🇩🇪 RAG Enterprise CV Analysis System</h1>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">🇩🇪 RAG CV Analysis System</h1>', unsafe_allow_html=True)
     
     # Sidebar
     with st.sidebar:
-        st.header("⚙️ Configuration")
-        
-        # API Key input
-        api_key = st.text_input(
-            "OpenAI API Key",
-            type="password",
-            value=st.session_state.get('api_key', ''),
-            help="Enter your OpenAI API key for LLM functionality"
-        )
-        
-        if api_key:
-            st.session_state.api_key = api_key
-        
-        st.divider()
-        
-        # Model selection
-        model_choice = st.selectbox(
-            "LLM Model",
-            ["gpt-4-turbo-preview", "gpt-3.5-turbo", "gpt-4"],
-            help="Select the LLM model for analysis"
-        )
-        
-        embedding_model = st.selectbox(
-            "Embedding Model",
-            ["text-embedding-3-small", "text-embedding-ada-002"],
-            help="Select embedding model for vector search"
-        )
-        
-        st.divider()
-        
-        # System stats
-        st.header("📊 System Statistics")
+        st.header("⚙️ System Info")
         st.metric("CVs in Database", len(st.session_state.cv_database))
-        st.metric("Conversations", len(st.session_state.chat_history))
+        
+        st.info("💡 Lightweight version - Optimized for Streamlit Cloud")
         
         if st.button("🔄 Reset System"):
-            st.session_state.rag_engine = None
             st.session_state.cv_database = []
-            st.session_state.chat_history = []
             st.rerun()
     
-    # Main content tabs
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    # Tabs
+    tab1, tab2, tab3, tab4 = st.tabs([
         "📤 Upload CVs",
-        "🔍 Search & Query",
-        "🤖 AI Analysis",
-        "📈 Neural Network Classifier",
-        "🔌 API Integration"
+        "🔍 Search",
+        "📊 Analytics",
+        "🔌 API Info"
     ])
     
-    # Tab 1: Upload CVs
+    # Tab 1: Upload
     with tab1:
         st.header("Upload German CVs")
         
         uploaded_files = st.file_uploader(
             "Upload CV files (PDF, DOCX, TXT)",
             type=['pdf', 'docx', 'txt'],
-            accept_multiple_files=True,
-            help="Upload one or multiple CV files in German"
+            accept_multiple_files=True
         )
         
-        if uploaded_files:
-            if st.button("Process CVs"):
-                initialize_system()
+        if uploaded_files and st.button("Process CVs"):
+            parser = CVParser()
+            progress_bar = st.progress(0)
+            
+            for idx, file in enumerate(uploaded_files):
+                with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.name).suffix) as tmp:
+                    tmp.write(file.read())
+                    tmp_path = tmp.name
                 
-                progress_bar = st.progress(0)
-                status_text = st.empty()
+                try:
+                    cv_data = parser.parse_cv(tmp_path, 'de')
+                    st.session_state.cv_database.append({
+                        'filename': file.name,
+                        'data': cv_data,
+                        'uploaded': datetime.now().isoformat()
+                    })
+                except Exception as e:
+                    st.error(f"Error: {file.name} - {str(e)}")
+                finally:
+                    Path(tmp_path).unlink()
                 
-                for idx, file in enumerate(uploaded_files):
-                    status_text.text(f"Processing {file.name}...")
-                    
-                    # Save file temporarily
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.name).suffix) as tmp_file:
-                        tmp_file.write(file.read())
-                        tmp_path = tmp_file.name
-                    
-                    try:
-                        # Parse CV
-                        parser = CVParser()
-                        cv_data = parser.parse_cv(tmp_path, language='de')
-                        
-                        # Add to RAG system
-                        st.session_state.rag_engine.add_document(cv_data, file.name)
-                        st.session_state.cv_database.append({
-                            'filename': file.name,
-                            'data': cv_data
-                        })
-                        
-                    except Exception as e:
-                        st.error(f"Error processing {file.name}: {str(e)}")
-                    finally:
-                        os.unlink(tmp_path)
-                    
-                    progress_bar.progress((idx + 1) / len(uploaded_files))
-                
-                status_text.text("✅ All CVs processed successfully!")
-                st.success(f"Processed {len(uploaded_files)} CV(s)")
+                progress_bar.progress((idx + 1) / len(uploaded_files))
+            
+            st.success(f"✅ Processed {len(uploaded_files)} CV(s)")
         
-        # Display uploaded CVs
+        # Display CVs
         if st.session_state.cv_database:
             st.subheader("📋 Processed CVs")
             for cv in st.session_state.cv_database:
                 with st.expander(f"📄 {cv['filename']}"):
-                    st.json(cv['data'])
+                    data = cv['data']
+                    st.markdown(f"**Name:** {data['personal_info'].get('name', 'N/A')}")
+                    st.markdown(f"**Email:** {data['personal_info'].get('email', 'N/A')}")
+                    st.markdown(f"**Skills:** {', '.join(data['skills'][:10])}")
+                    st.markdown(f"**Experience:** {len(data['experience'])} positions found")
+                    st.markdown(f"**Education:** {len(data['education'])} entries found")
     
-    # Tab 2: Search & Query
+    # Tab 2: Search
     with tab2:
-        st.header("Semantic Search & Query")
+        st.header("Search CVs")
         
         if not st.session_state.cv_database:
-            st.warning("⚠️ Please upload CVs first in the 'Upload CVs' tab")
+            st.warning("⚠️ Please upload CVs first")
         else:
             search_query = st.text_input(
-                "Enter search query (in German or English)",
-                placeholder="e.g., 'Erfahrung mit Python und Machine Learning'"
+                "Search query",
+                placeholder="e.g., Python, Machine Learning, Berlin"
             )
             
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                top_k = st.slider("Number of results", 1, 10, 3)
-            with col2:
-                search_button = st.button("🔍 Search", use_container_width=True)
-            
-            if search_button and search_query:
-                initialize_system()
+            if st.button("🔍 Search") and search_query:
+                results = simple_search(search_query, st.session_state.cv_database)
                 
-                with st.spinner("Searching CVs..."):
-                    results = st.session_state.rag_engine.search(search_query, top_k=top_k)
-                    
-                    st.subheader("Search Results")
-                    for idx, result in enumerate(results, 1):
-                        with st.expander(f"Result {idx}: {result['filename']} (Score: {result['score']:.4f})"):
-                            st.markdown(f"**Content:**\n{result['content']}")
-                            st.markdown(f"**Metadata:**")
-                            st.json(result['metadata'])
+                st.subheader(f"Found {len(results)} Results")
+                
+                for idx, result in enumerate(results[:10], 1):
+                    with st.expander(f"Result {idx}: {result['filename']} (Score: {result['score']:.4f})"):
+                        st.markdown(result['snippet'])
     
-    # Tab 3: AI Analysis
+    # Tab 3: Analytics
     with tab3:
-        st.header("AI-Powered CV Analysis")
+        st.header("CV Analytics")
         
         if not st.session_state.cv_database:
-            st.warning("⚠️ Please upload CVs first in the 'Upload CVs' tab")
+            st.warning("⚠️ Please upload CVs first")
         else:
-            st.subheader("Ask Questions About CVs")
+            col1, col2, col3 = st.columns(3)
             
-            user_question = st.text_area(
-                "Your question",
-                placeholder="z.B. 'Welche Kandidaten haben Erfahrung mit Deep Learning?'",
-                height=100
-            )
+            with col1:
+                st.metric("Total CVs", len(st.session_state.cv_database))
             
-            if st.button("💡 Get AI Answer"):
-                if not st.session_state.get('api_key'):
-                    st.error("❌ Please enter your API key in the sidebar")
-                elif user_question:
-                    initialize_system()
-                    
-                    with st.spinner("Generating AI response..."):
-                        response = st.session_state.rag_engine.query(user_question)
-                        
-                        st.session_state.chat_history.append({
-                            'question': user_question,
-                            'answer': response
-                        })
-                        
-                        st.markdown("### 🤖 AI Response")
-                        st.markdown(f"<div class='metric-card'>{response['answer']}</div>", unsafe_allow_html=True)
-                        
-                        if response.get('sources'):
-                            with st.expander("📚 Sources"):
-                                for source in response['sources']:
-                                    st.markdown(f"- **{source['filename']}** (Relevance: {source['score']:.2%})")
+            with col2:
+                total_skills = sum(len(cv['data']['skills']) for cv in st.session_state.cv_database)
+                st.metric("Total Skills", total_skills)
             
-            # Chat history
-            if st.session_state.chat_history:
-                st.divider()
-                st.subheader("💬 Conversation History")
-                for idx, chat in enumerate(reversed(st.session_state.chat_history[-5:]), 1):
-                    with st.expander(f"Q{idx}: {chat['question'][:50]}..."):
-                        st.markdown(f"**Question:** {chat['question']}")
-                        st.markdown(f"**Answer:** {chat['answer']['answer']}")
+            with col3:
+                avg_exp = sum(len(cv['data']['experience']) for cv in st.session_state.cv_database) / max(len(st.session_state.cv_database), 1)
+                st.metric("Avg. Positions", f"{avg_exp:.1f}")
+            
+            st.subheader("📊 Skill Distribution")
+            
+            # Collect all skills
+            all_skills = {}
+            for cv in st.session_state.cv_database:
+                for skill in cv['data']['skills']:
+                    all_skills[skill] = all_skills.get(skill, 0) + 1
+            
+            if all_skills:
+                sorted_skills = sorted(all_skills.items(), key=lambda x: x[1], reverse=True)[:10]
+                st.bar_chart({skill: count for skill, count in sorted_skills})
+            
+            st.subheader("📋 CV Summary Table")
+            
+            table_data = []
+            for cv in st.session_state.cv_database:
+                table_data.append({
+                    "CV": cv['filename'],
+                    "Name": cv['data']['personal_info'].get('name', 'N/A'),
+                    "Skills": len(cv['data']['skills']),
+                    "Experience": len(cv['data']['experience']),
+                    "Education": len(cv['data']['education'])
+                })
+            
+            st.table(table_data)
     
-    # Tab 4: Neural Network Classifier
+    # Tab 4: API Info
     with tab4:
-        st.header("Neural Network-Based CV Classification")
-        
-        if not st.session_state.cv_database:
-            st.warning("⚠️ Please upload CVs first in the 'Upload CVs' tab")
-        else:
-            st.markdown("""
-            The neural network classifier categorizes CVs based on:
-            - **Job Category** (IT, Engineering, Management, etc.)
-            - **Experience Level** (Junior, Mid-level, Senior)
-            - **Skill Match Score** for specific requirements
-            """)
-            
-            if st.button("🧠 Classify All CVs"):
-                with st.spinner("Running neural network classification..."):
-                    classifier = CVClassifier()
-                    
-                    results_data = []
-                    for cv in st.session_state.cv_database:
-                        classification = classifier.classify(cv['data'])
-                        results_data.append({
-                            'CV': cv['filename'],
-                            'Category': classification['category'],
-                            'Level': classification['experience_level'],
-                            'Confidence': f"{classification['confidence']:.2%}"
-                        })
-                    
-                    st.subheader("Classification Results")
-                    st.table(results_data)
-                    
-                    # Visualization
-                    st.subheader("📊 Distribution Analysis")
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        categories = [r['Category'] for r in results_data]
-                        st.markdown("**Job Categories**")
-                        category_counts = {cat: categories.count(cat) for cat in set(categories)}
-                        st.bar_chart(category_counts)
-                    
-                    with col2:
-                        levels = [r['Level'] for r in results_data]
-                        st.markdown("**Experience Levels**")
-                        level_counts = {lvl: levels.count(lvl) for lvl in set(levels)}
-                        st.bar_chart(level_counts)
-    
-    # Tab 5: API Integration
-    with tab5:
-        st.header("API Integration & Enterprise Endpoints")
+        st.header("API Integration")
         
         st.markdown("""
         ### Available REST API Endpoints
         
-        This system provides RESTful APIs for enterprise integration:
+        This system can be extended with the following APIs:
         """)
         
-        api_handler = APIHandler()
-        
         endpoints = [
-            {
-                "Method": "POST",
-                "Endpoint": "/api/v1/upload",
-                "Description": "Upload and process CV files"
-            },
-            {
-                "Method": "GET",
-                "Endpoint": "/api/v1/search",
-                "Description": "Semantic search across CVs"
-            },
-            {
-                "Method": "POST",
-                "Endpoint": "/api/v1/query",
-                "Description": "AI-powered CV analysis"
-            },
-            {
-                "Method": "POST",
-                "Endpoint": "/api/v1/classify",
-                "Description": "Neural network classification"
-            },
-            {
-                "Method": "GET",
-                "Endpoint": "/api/v1/cvs",
-                "Description": "List all processed CVs"
-            }
+            {"Method": "POST", "Endpoint": "/api/v1/upload", "Description": "Upload CV files"},
+            {"Method": "GET", "Endpoint": "/api/v1/search", "Description": "Search CVs"},
+            {"Method": "GET", "Endpoint": "/api/v1/cvs", "Description": "List all CVs"},
+            {"Method": "GET", "Endpoint": "/api/v1/analytics", "Description": "Get analytics"},
         ]
         
         st.table(endpoints)
         
-        st.subheader("🧪 Test API Functionality")
-        
-        test_endpoint = st.selectbox("Select endpoint to test", [e["Endpoint"] for e in endpoints])
-        
-        if "search" in test_endpoint:
-            test_query = st.text_input("Search query", "Python Machine Learning")
-            if st.button("Test Search API"):
-                result = api_handler.test_search(test_query, st.session_state.cv_database)
-                st.json(result)
-        
-        elif "query" in test_endpoint:
-            test_query = st.text_area("Query", "Welche Kandidaten haben AI Erfahrung?")
-            if st.button("Test Query API"):
-                if st.session_state.get('api_key'):
-                    initialize_system()
-                    result = api_handler.test_query(test_query, st.session_state.rag_engine)
-                    st.json(result)
-                else:
-                    st.error("API key required")
-        
-        st.divider()
-        
-        st.subheader("📝 API Documentation")
         st.markdown("""
-        **Authentication:** Bearer token required in header
-        ```
-        Authorization: Bearer YOUR_API_KEY
-        ```
+        ### Export Data
         
-        **Example cURL Request:**
-        ```
-        curl -X POST https://your-api.com/api/v1/search \
-          -H "Authorization: Bearer YOUR_KEY" \
-          -H "Content-Type: application/json" \
-          -d '{"query": "Python Developer", "top_k": 5}'
-        ```
+        Download your CV database:
         """)
+        
+        if st.session_state.cv_database:
+            json_data = json.dumps(st.session_state.cv_database, indent=2, ensure_ascii=False)
+            st.download_button(
+                label="📥 Download CV Database (JSON)",
+                data=json_data,
+                file_name="cv_database.json",
+                mime="application/json"
+            )
 
 if __name__ == "__main__":
     main()
